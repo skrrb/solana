@@ -259,6 +259,8 @@ impl Accounts {
             let mut accounts = Vec::with_capacity(account_keys.len());
             let mut account_deps = Vec::with_capacity(account_keys.len());
             let mut rent_debits = RentDebits::default();
+            let preserve_rent_epoch_for_rent_exempt_accounts = feature_set
+                .is_active(&feature_set::preserve_rent_epoch_for_rent_exempt_accounts::id());
             for (i, key) in account_keys.iter().enumerate() {
                 let account = if !message.is_non_loader_key(i) {
                     // Fill in an empty account for the program slots.
@@ -286,6 +288,7 @@ impl Accounts {
                                                 key,
                                                 &mut account,
                                                 self.accounts_db.filler_account_suffix.as_ref(),
+                                                preserve_rent_epoch_for_rent_exempt_accounts,
                                             )
                                             .rent_amount;
                                         (account, rent_due)
@@ -1161,16 +1164,20 @@ impl Accounts {
     /// Store the accounts into the DB
     // allow(clippy) needed for various gating flags
     #[allow(clippy::too_many_arguments)]
-    pub fn store_cached<'a>(
+    pub(crate) fn store_cached(
         &self,
         slot: Slot,
-        txs: &'a [SanitizedTransaction],
-        res: &'a [TransactionExecutionResult],
-        loaded: &'a mut [TransactionLoadResult],
+        txs: &[SanitizedTransaction],
+        res: &[TransactionExecutionResult],
+        loaded: &mut [TransactionLoadResult],
         rent_collector: &RentCollector,
         durable_nonce: &(DurableNonce, /*separate_domains:*/ bool),
         lamports_per_signature: u64,
+<<<<<<< HEAD
         leave_nonce_on_success: bool,
+=======
+        preserve_rent_epoch_for_rent_exempt_accounts: bool,
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
     ) {
         let accounts_to_store = self.collect_accounts_to_store(
             txs,
@@ -1179,7 +1186,11 @@ impl Accounts {
             rent_collector,
             durable_nonce,
             lamports_per_signature,
+<<<<<<< HEAD
             leave_nonce_on_success,
+=======
+            preserve_rent_epoch_for_rent_exempt_accounts,
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
         );
         self.accounts_db.store_cached(slot, &accounts_to_store);
     }
@@ -1205,8 +1216,16 @@ impl Accounts {
         rent_collector: &RentCollector,
         durable_nonce: &(DurableNonce, /*separate_domains:*/ bool),
         lamports_per_signature: u64,
+<<<<<<< HEAD
         leave_nonce_on_success: bool,
     ) -> Vec<(&'a Pubkey, &'a AccountSharedData)> {
+=======
+        preserve_rent_epoch_for_rent_exempt_accounts: bool,
+    ) -> (
+        Vec<(&'a Pubkey, &'a AccountSharedData)>,
+        Vec<Option<&'a Signature>>,
+    ) {
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
         let mut accounts = Vec::with_capacity(load_results.len());
         for (i, ((tx_load_result, nonce), tx)) in load_results.iter_mut().zip(txs).enumerate() {
             if tx_load_result.is_err() {
@@ -1264,7 +1283,11 @@ impl Accounts {
                     if execution_status.is_ok() || is_nonce_account || is_fee_payer {
                         if account.rent_epoch() == INITIAL_RENT_EPOCH {
                             let rent = rent_collector
-                                .collect_from_created_account(address, account)
+                                .collect_from_created_account(
+                                    address,
+                                    account,
+                                    preserve_rent_epoch_for_rent_exempt_accounts,
+                                )
                                 .rent_amount;
                             loaded_transaction.rent += rent;
                             loaded_transaction.rent_debits.insert(
@@ -3001,7 +3024,11 @@ mod tests {
             &rent_collector,
             &(DurableNonce::default(), /*separate_domains:*/ true),
             0,
+<<<<<<< HEAD
             true, // leave_nonce_on_success
+=======
+            true, // preserve_rent_epoch_for_rent_exempt_accounts
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
         );
         assert_eq!(collected_accounts.len(), 2);
         assert!(collected_accounts
@@ -3500,7 +3527,11 @@ mod tests {
             &rent_collector,
             &(durable_nonce, /*separate_domains:*/ true),
             0,
+<<<<<<< HEAD
             true, // leave_nonce_on_success
+=======
+            true, // preserve_rent_epoch_for_rent_exempt_accounts
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
         );
         assert_eq!(collected_accounts.len(), 2);
         assert_eq!(
@@ -3628,7 +3659,11 @@ mod tests {
             &rent_collector,
             &(durable_nonce, /*separate_domains:*/ true),
             0,
+<<<<<<< HEAD
             true, // leave_nonce_on_success
+=======
+            true, // preserve_rent_epoch_for_rent_exempt_accounts
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
         );
         assert_eq!(collected_accounts.len(), 1);
         let collected_nonce_account = collected_accounts

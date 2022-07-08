@@ -4612,7 +4612,11 @@ impl Bank {
             &self.rent_collector,
             &durable_nonce,
             lamports_per_signature,
+<<<<<<< HEAD
             self.leave_nonce_on_success(),
+=======
+            self.preserve_rent_epoch_for_rent_exempt_accounts(),
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
         );
         let rent_debits = self.collect_rent(&execution_results, loaded_txs);
 
@@ -4905,8 +4909,106 @@ impl Bank {
         }
     }
 
+<<<<<<< HEAD
     fn collect_rent_in_partition(&self, partition: Partition) -> usize {
         let subrange = Self::pubkey_range_from_partition(partition);
+=======
+    /// Collect rent from `accounts`
+    ///
+    /// This fn is called inside a parallel loop from `collect_rent_in_partition()`.  Avoid adding
+    /// any code that causes contention on shared memory/data (i.e. do not update atomic metrics).
+    ///
+    /// The return value is a struct of computed values that `collect_rent_in_partition()` will
+    /// reduce at the end of its parallel loop.  If possible, place data/computation that cause
+    /// contention/take locks in the return struct and process them in
+    /// `collect_rent_from_partition()` after reducing the parallel loop.
+    fn collect_rent_from_accounts(
+        &self,
+        mut accounts: Vec<(Pubkey, AccountSharedData, Slot)>,
+        just_rewrites: bool,
+    ) -> CollectRentFromAccountsInfo {
+        let mut rent_debits = RentDebits::default();
+        let mut total_rent_collected_info = CollectedInfo::default();
+        let bank_slot = self.slot();
+        let mut rewrites_skipped = Vec::with_capacity(accounts.len());
+        let mut accounts_to_store =
+            Vec::<(&Pubkey, &AccountSharedData)>::with_capacity(accounts.len());
+        let mut time_collecting_rent_us = 0;
+        let mut time_hashing_skipped_rewrites_us = 0;
+        let mut time_storing_accounts_us = 0;
+        let can_skip_rewrites = self.rc.accounts.accounts_db.skip_rewrites || just_rewrites;
+        for (pubkey, account, loaded_slot) in accounts.iter_mut() {
+            let old_rent_epoch = account.rent_epoch();
+            let (rent_collected_info, measure) =
+                measure!(self.rent_collector.collect_from_existing_account(
+                    pubkey,
+                    account,
+                    self.rc.accounts.accounts_db.filler_account_suffix.as_ref(),
+                    self.preserve_rent_epoch_for_rent_exempt_accounts(),
+                ));
+            time_collecting_rent_us += measure.as_us();
+
+            // only store accounts where we collected rent
+            // but get the hash for all these accounts even if collected rent is 0 (= not updated).
+            // Also, there's another subtle side-effect from this: this
+            // ensures we verify the whole on-chain state (= all accounts)
+            // via the bank delta hash slowly once per an epoch.
+            if can_skip_rewrites
+                && Self::skip_rewrite(
+                    bank_slot,
+                    rent_collected_info.rent_amount,
+                    *loaded_slot,
+                    old_rent_epoch,
+                    account,
+                )
+            {
+                // this would have been rewritten previously. Now we skip it.
+                // calculate the hash that we would have gotten if we did the rewrite.
+                // This will be needed to calculate the bank's hash.
+                let (hash, measure) = measure!(crate::accounts_db::AccountsDb::hash_account(
+                    self.slot(),
+                    account,
+                    pubkey
+                ));
+                time_hashing_skipped_rewrites_us += measure.as_us();
+                rewrites_skipped.push((*pubkey, hash));
+                assert_eq!(rent_collected_info, CollectedInfo::default());
+            } else if !just_rewrites {
+                total_rent_collected_info += rent_collected_info;
+                accounts_to_store.push((pubkey, account));
+            }
+            rent_debits.insert(pubkey, rent_collected_info.rent_amount, account.lamports());
+        }
+
+        if !accounts_to_store.is_empty() {
+            // TODO: Maybe do not call `store_accounts()` here.  Instead return `accounts_to_store`
+            // and have `collect_rent_in_partition()` perform all the stores.
+            let (_, measure) = measure!(self.store_accounts((self.slot(), &accounts_to_store[..])));
+            time_storing_accounts_us += measure.as_us();
+        }
+
+        CollectRentFromAccountsInfo {
+            rent_collected_info: total_rent_collected_info,
+            rent_rewards: rent_debits.into_unordered_rewards_iter().collect(),
+            rewrites_skipped,
+            time_collecting_rent_us,
+            time_hashing_skipped_rewrites_us,
+            time_storing_accounts_us,
+            num_accounts: accounts.len(),
+        }
+    }
+
+    /// convert 'partition' to a pubkey range and 'collect_rent_in_range'
+    fn collect_rent_in_partition(
+        &self,
+        partition: Partition,
+        just_rewrites: bool,
+        metrics: &RentMetrics,
+    ) {
+        let subrange_full = Self::pubkey_range_from_partition(partition);
+        self.collect_rent_in_range(subrange_full, just_rewrites, metrics)
+    }
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
 
         let thread_pool = &self.rc.accounts.accounts_db.thread_pool;
         self.rc
@@ -6588,6 +6690,11 @@ impl Bank {
             .is_active(&feature_set::send_to_tpu_vote_port::id())
     }
 
+    fn preserve_rent_epoch_for_rent_exempt_accounts(&self) -> bool {
+        self.feature_set
+            .is_active(&feature_set::preserve_rent_epoch_for_rent_exempt_accounts::id())
+    }
+
     pub fn read_cost_tracker(&self) -> LockResult<RwLockReadGuard<CostTracker>> {
         self.cost_tracker.read()
     }
@@ -7428,6 +7535,7 @@ pub(crate) mod tests {
                 &keypairs[4].pubkey(),
                 &mut account_copy,
                 None,
+                true, // preserve_rent_epoch_for_rent_exempt_accounts
             );
             assert_eq!(expected_rent.rent_amount, too_few_lamports);
             assert_eq!(account_copy.lamports(), 0);
@@ -8951,7 +9059,33 @@ pub(crate) mod tests {
             vec![genesis_slot]
         );
 
+<<<<<<< HEAD
         bank.collect_rent_in_partition((0, 0, 1)); // all range
+=======
+        assert_eq!(bank.collected_rent.load(Relaxed), 0);
+        assert!(bank.rewrites_skipped_this_slot.read().unwrap().is_empty());
+        bank.collect_rent_in_partition((0, 0, 1), true, &RentMetrics::default());
+        {
+            let rewrites_skipped = bank.rewrites_skipped_this_slot.read().unwrap();
+            // `rewrites_skipped.len()` is the number of non-rent paying accounts in the slot.
+            // 'collect_rent_in_partition' fills 'rewrites_skipped_this_slot' with rewrites that
+            // were skipped during rent collection but should still be considered in the slot's
+            // bank hash. If the slot is also written in the append vec, then the bank hash calc
+            // code ignores the contents of this list. This assert is confirming that the expected #
+            // of accounts were included in 'rewrites_skipped' by the call to
+            // 'collect_rent_in_partition(..., true)' above.
+            assert_eq!(rewrites_skipped.len(), 1);
+            // should not have skipped 'rent_exempt_pubkey'
+            // Once preserve_rent_epoch_for_rent_exempt_accounts is activated,
+            // rewrite-skip is irrelevant to rent-exempt accounts.
+            assert!(!rewrites_skipped.contains_key(&rent_exempt_pubkey));
+            // should NOT have skipped 'rent_due_pubkey'
+            assert!(!rewrites_skipped.contains_key(&rent_due_pubkey));
+        }
+
+        assert_eq!(bank.collected_rent.load(Relaxed), 0);
+        bank.collect_rent_in_partition((0, 0, 1), false, &RentMetrics::default()); // all range
+>>>>>>> c99d9f00a (preserves rent_epoch for rent exempt accounts (#26479))
 
         assert_eq!(bank.collected_rent.load(Relaxed), rent_collected);
         assert_eq!(
@@ -8966,9 +9100,11 @@ pub(crate) mod tests {
             bank.get_account(&rent_exempt_pubkey).unwrap().lamports(),
             large_lamports
         );
+        // Once preserve_rent_epoch_for_rent_exempt_accounts is activated,
+        // rent_epoch of rent-exempt accounts will no longer advance.
         assert_eq!(
             bank.get_account(&rent_exempt_pubkey).unwrap().rent_epoch(),
-            current_epoch
+            0
         );
         assert_eq!(
             bank.slots_by_pubkey(&rent_due_pubkey, &ancestors),
@@ -18150,6 +18286,7 @@ pub(crate) mod tests {
                 &keypair.pubkey(),
                 &mut account,
                 None,
+                true, // preserve_rent_epoch_for_rent_exempt_accounts
             );
             assert_eq!(info.account_data_len_reclaimed, data_size as u64);
         }
