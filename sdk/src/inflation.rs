@@ -1,5 +1,7 @@
 //! configuration for network inflation
 
+use {lazy_static::lazy_static, solana_sdk::pubkey::Pubkey, std::collections::HashMap};
+
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Copy, AbiExample)]
 #[serde(rename_all = "camelCase")]
 pub struct Inflation {
@@ -27,6 +29,26 @@ const DEFAULT_TERMINAL: f64 = 0.015;
 const DEFAULT_TAPER: f64 = 0.15;
 const DEFAULT_FOUNDATION: f64 = 0.05;
 const DEFAULT_FOUNDATION_TERM: f64 = 7.0;
+
+pub mod vault_addresses {
+    pub mod foo {
+        solana_sdk::declare_id!("dummy11111111111111111111111111111111111111");
+    }
+
+    pub mod bar {
+        solana_sdk::declare_id!("dummy22222222222222222222222222222222222222");
+    }
+}
+
+lazy_static! {
+    pub static ref VAULT_ADDRESSES: HashMap<Pubkey, f64> = [
+        (vault_addresses::foo::id(), 0.01),
+        (vault_addresses::bar::id(), 0.02),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+}
 
 impl Default for Inflation {
     fn default() -> Self {
@@ -94,7 +116,7 @@ impl Inflation {
 
     /// portion of total that goes to validators
     pub fn validator(&self, year: f64) -> f64 {
-        self.total(year) - self.foundation(year)
+        self.total(year) - self.foundation(year) - self.vault()
     }
 
     /// portion of total that goes to foundation
@@ -104,6 +126,11 @@ impl Inflation {
         } else {
             0.0
         }
+    }
+
+    /// portion of total that goes to the listed vaults
+    pub fn vault(&self) -> f64 {
+        VAULT_ADDRESSES.values().sum()
     }
 }
 

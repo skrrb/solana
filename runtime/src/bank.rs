@@ -146,7 +146,7 @@ use {
         hard_forks::HardForks,
         hash::{extend_and_hash, hashv, Hash},
         incinerator,
-        inflation::Inflation,
+        inflation::{Inflation, VAULT_ADDRESSES},
         instruction::InstructionError,
         lamports::LamportsError,
         loader_v4::{self, LoaderV4State, LoaderV4Status},
@@ -876,8 +876,10 @@ struct PartitionedRewardsCalculation {
     stake_rewards_by_partition: StakeRewardCalculationPartitioned,
     old_vote_balance_and_staked: u64,
     validator_rewards: u64,
+    vault_rewards: u64,
     validator_rate: f64,
     foundation_rate: f64,
+    vault_rate: f64,
     prev_epoch_duration_in_years: f64,
     capitalization: u64,
 }
@@ -914,9 +916,11 @@ pub struct BankTestConfig {
 #[derive(Debug)]
 struct PrevEpochInflationRewards {
     validator_rewards: u64,
+    vault_rewards: u64,
     prev_epoch_duration_in_years: f64,
     validator_rate: f64,
     foundation_rate: f64,
+    vault_rate: f64,
 }
 
 pub struct CommitTransactionCounts {
@@ -1623,7 +1627,7 @@ impl Bank {
             total_rewards,
             distributed_rewards,
             stake_rewards_by_partition,
-        } = self.calculate_rewards_and_distribute_vote_rewards(
+        } = self.calculate_rewards_and_distribute_vote_and_vault_rewards(
             parent_epoch,
             reward_calc_tracer,
             thread_pool,
@@ -2331,24 +2335,29 @@ impl Bank {
         prev_epoch: Epoch,
     ) -> PrevEpochInflationRewards {
         let slot_in_year = self.slot_in_year_for_inflation();
-        let (validator_rate, foundation_rate) = {
+        let (validator_rate, foundation_rate, vault_rate) = {
             let inflation = self.inflation.read().unwrap();
             (
                 (*inflation).validator(slot_in_year),
                 (*inflation).foundation(slot_in_year),
+                (*inflation).vault(),
             )
         };
 
         let prev_epoch_duration_in_years = self.epoch_duration_in_years(prev_epoch);
-        let validator_rewards = (validator_rate
-            * prev_epoch_capitalization as f64
-            * prev_epoch_duration_in_years) as u64;
+        let prev_epoch_capitalization_in_years =
+            prev_epoch_capitalization as f64 * prev_epoch_duration_in_years;
+
+        let validator_rewards = (validator_rate * prev_epoch_capitalization_in_years) as u64;
+        let vault_rewards = (vault_rate * prev_epoch_capitalization_in_years) as u64;
 
         PrevEpochInflationRewards {
             validator_rewards,
+            vault_rewards,
             prev_epoch_duration_in_years,
             validator_rate,
             foundation_rate,
+            vault_rate,
         }
     }
 
@@ -2363,9 +2372,11 @@ impl Bank {
         let capitalization = self.capitalization();
         let PrevEpochInflationRewards {
             validator_rewards,
+            vault_rewards,
             prev_epoch_duration_in_years,
             validator_rate,
             foundation_rate,
+            vault_rate,
         } = self.calculate_previous_epoch_inflation_rewards(capitalization, prev_epoch);
 
         let old_vote_balance_and_staked = self.stakes_cache.stakes().vote_balance_and_staked();
@@ -2395,15 +2406,17 @@ impl Bank {
             },
             old_vote_balance_and_staked,
             validator_rewards,
+            vault_rewards,
             validator_rate,
             foundation_rate,
+            vault_rate,
             prev_epoch_duration_in_years,
             capitalization,
         }
     }
 
-    // Calculate rewards from previous epoch and distribute vote rewards
-    fn calculate_rewards_and_distribute_vote_rewards(
+    // Calculate rewards from previous epoch and distribute vote & vault rewards
+    fn calculate_rewards_and_distribute_vote_and_vault_rewards(
         &self,
         prev_epoch: Epoch,
         reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
@@ -2415,8 +2428,10 @@ impl Bank {
             stake_rewards_by_partition,
             old_vote_balance_and_staked,
             validator_rewards,
+            vault_rewards,
             validator_rate,
             foundation_rate,
+            vault_rate,
             prev_epoch_duration_in_years,
             capitalization,
         } = self.calculate_rewards_for_partitioning(
@@ -2443,7 +2458,10 @@ impl Bank {
         let validator_rewards_paid = new_vote_balance_and_staked - old_vote_balance_and_staked;
         self.assert_validator_rewards_paid(validator_rewards_paid);
 
+        let vault_rewards_paid = self.pay_vault_rewards(vault_rewards);
+
         // verify that we didn't pay any more than we expected to
+        assert!(vault_rewards >= vault_rewards_paid);
         assert!(validator_rewards >= validator_rewards_paid + total_stake_rewards_lamports);
 
         info!(
@@ -2458,8 +2476,9 @@ impl Bank {
                 stakes.vote_accounts().len(),
             )
         };
-        self.capitalization
-            .fetch_add(validator_rewards_paid, Relaxed);
+
+        let total_rewards_paid = validator_rewards_paid + vault_rewards_paid;
+        self.capitalization.fetch_add(total_rewards_paid, Relaxed);
 
         let active_stake = if let Some(stake_history_entry) =
             self.stakes_cache.stakes().history().get(prev_epoch)
@@ -2475,8 +2494,10 @@ impl Bank {
             ("epoch", prev_epoch, i64),
             ("validator_rate", validator_rate, f64),
             ("foundation_rate", foundation_rate, f64),
+            ("vault_rate", vault_rate, f64),
             ("epoch_duration_in_years", prev_epoch_duration_in_years, f64),
             ("validator_rewards", validator_rewards_paid, i64),
+            ("vault_rewards_paid", vault_rewards_paid, i64),
             ("active_stake", active_stake, i64),
             ("pre_capitalization", capitalization, i64),
             ("post_capitalization", self.capitalization(), i64),
@@ -2485,8 +2506,8 @@ impl Bank {
         );
 
         CalculateRewardsAndDistributeVoteRewardsResult {
-            total_rewards: validator_rewards_paid + total_stake_rewards_lamports,
-            distributed_rewards: validator_rewards_paid,
+            total_rewards: total_rewards_paid + total_stake_rewards_lamports,
+            distributed_rewards: total_rewards_paid,
             stake_rewards_by_partition,
         }
     }
@@ -2522,9 +2543,11 @@ impl Bank {
         let capitalization = self.capitalization();
         let PrevEpochInflationRewards {
             validator_rewards,
+            vault_rewards,
             prev_epoch_duration_in_years,
             validator_rate,
             foundation_rate,
+            vault_rate,
         } = self.calculate_previous_epoch_inflation_rewards(capitalization, prev_epoch);
 
         let old_vote_balance_and_staked = self.stakes_cache.stakes().vote_balance_and_staked();
@@ -2539,6 +2562,7 @@ impl Bank {
 
         let new_vote_balance_and_staked = self.stakes_cache.stakes().vote_balance_and_staked();
         let validator_rewards_paid = new_vote_balance_and_staked - old_vote_balance_and_staked;
+
         assert_eq!(
             validator_rewards_paid,
             u64::try_from(
@@ -2557,12 +2581,18 @@ impl Bank {
             .unwrap()
         );
 
+        let vault_rewards_paid = self.pay_vault_rewards(vault_rewards);
+
         // verify that we didn't pay any more than we expected to
+        assert!(vault_rewards >= vault_rewards_paid);
         assert!(validator_rewards >= validator_rewards_paid);
+
+        let total_rewards_paid = validator_rewards_paid + vault_rewards_paid;
 
         info!(
             "distributed inflation: {} (rounded from: {})",
-            validator_rewards_paid, validator_rewards
+            total_rewards_paid,
+            validator_rewards + vault_rewards
         );
         let (num_stake_accounts, num_vote_accounts) = {
             let stakes = self.stakes_cache.stakes();
@@ -2571,8 +2601,7 @@ impl Bank {
                 stakes.vote_accounts().len(),
             )
         };
-        self.capitalization
-            .fetch_add(validator_rewards_paid, Relaxed);
+        self.capitalization.fetch_add(total_rewards_paid, Relaxed);
 
         let active_stake = if let Some(stake_history_entry) =
             self.stakes_cache.stakes().history().get(prev_epoch)
@@ -2588,6 +2617,7 @@ impl Bank {
             ("epoch", prev_epoch, i64),
             ("validator_rate", validator_rate, f64),
             ("foundation_rate", foundation_rate, f64),
+            ("vault_rate", vault_rate, f64),
             ("epoch_duration_in_years", prev_epoch_duration_in_years, f64),
             ("validator_rewards", validator_rewards_paid, i64),
             ("active_stake", active_stake, i64),
@@ -2783,6 +2813,19 @@ impl Bank {
                 metrics,
             )
         })
+    }
+
+    fn pay_vault_rewards(&self, rewards: u64) -> u64 {
+        VAULT_ADDRESSES
+            .iter()
+            .filter_map(|(pubkey, weight)| {
+                let mut account = self.get_account_with_fixed_root(pubkey)?;
+                let rewards = (rewards as f64 * weight) as u64;
+                account.saturating_add_lamports(rewards);
+                self.store_account(pubkey, &account);
+                Some(rewards)
+            })
+            .sum()
     }
 
     /// Load, calculate and payout epoch rewards for stake and vote accounts
